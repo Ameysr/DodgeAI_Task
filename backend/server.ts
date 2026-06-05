@@ -51,7 +51,7 @@ app.use(
       }
     },
     methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type", "x-session-id"],
+    allowedHeaders: ["Content-Type", "x-session-id", "x-db-id"],
   }),
 );
 app.use(express.json({ limit: "10kb" })); // Limit body size to prevent abuse

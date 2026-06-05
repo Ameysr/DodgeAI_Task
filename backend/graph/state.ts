@@ -1,7 +1,14 @@
 import type {
-  IntentType, ComplexityLevel, PathTaken, TierNumber,
-  HistoryMessage, EntityMap, SelectedFunction, QueryResult, Confidence
-} from '../types/index.js';
+  IntentType,
+  ComplexityLevel,
+  PathTaken,
+  TierNumber,
+  HistoryMessage,
+  EntityMap,
+  SelectedFunction,
+  QueryResult,
+  Confidence,
+} from "../types/index.js";
 
 export interface RoutingTracePlanCandidate {
   id: string;
@@ -25,6 +32,7 @@ export interface O2CGraphState {
   // Input
   userMessage: string;
   sessionId: string;
+  dbId: string;
   startTime: number;
 
   // Memory loaded from Redis
@@ -41,13 +49,13 @@ export interface O2CGraphState {
   extractedEntities: EntityMap;
 
   // Intent + complexity
-  intentType: IntentType | '';
-  complexity: ComplexityLevel | '';
+  intentType: IntentType | "";
+  complexity: ComplexityLevel | "";
   tierToUse: TierNumber;
 
   // Function selection
   selectedFunction: SelectedFunction | null;
-  pathTaken: PathTaken | '';
+  pathTaken: PathTaken | "";
 
   // Execution
   queryResults: QueryResult[];
@@ -67,26 +75,27 @@ export interface O2CGraphState {
 }
 
 export const initialState: O2CGraphState = {
-  userMessage: '',
-  sessionId: '',
+  userMessage: "",
+  sessionId: "",
+  dbId: "",
   startTime: 0,
   history: [],
   entities: {},
-  resolvedMessage: '',
+  resolvedMessage: "",
   isRelevant: null,
   extractedEntities: {},
-  intentType: '',
-  complexity: '',
+  intentType: "",
+  complexity: "",
   tierToUse: 1,
   selectedFunction: null,
-  pathTaken: '',
+  pathTaken: "",
   queryResults: [],
   queryError: null,
   retryCount: 0,
   executedCypher: null,
-  answer: '',
+  answer: "",
   nodesReferenced: [],
-  confidence: '',
+  confidence: "",
   latencyMs: 0,
   usedFallback: false,
   routingTrace: {

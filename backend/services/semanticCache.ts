@@ -1,90 +1,104 @@
-import { getRedis } from '../redis.js';
-import { getLocalEmbedding } from './embedding.js';
-import { cosineSimilarity } from '../utils/math.js';
-import crypto from 'crypto';
+import { getRedis } from "../redis.js";
+import { getLocalEmbedding } from "./embedding.js";
+import { cosineSimilarity } from "../utils/math.js";
+import crypto from "crypto";
 
 const CACHE_TTL = 86400; // 24 hours
 const SIMILARITY_THRESHOLD = 0.85; // Lowered slightly for domain-vocab vectors
-const SEMCACHE_SCAN_KEYS = parseInt(process.env.SEMCACHE_SCAN_KEYS ?? '200', 10);
-const SEMCACHE_VERSION = process.env.SEMCACHE_VERSION ?? 'v3';
-const SEMCACHE_INDEX_KEY = `semcache:index:${SEMCACHE_VERSION}`;
+const SEMCACHE_SCAN_KEYS = parseInt(
+  process.env.SEMCACHE_SCAN_KEYS ?? "200",
+  10,
+);
+const SEMCACHE_VERSION = process.env.SEMCACHE_VERSION ?? "v3";
 
-function hashKey(text: string): string {
-  const payload = `${SEMCACHE_VERSION}|` + text.toLowerCase().trim();
-  return 'semcache:' + crypto.createHash('sha256').update(payload).digest('hex').substring(0, 16);
+function buildIndexKey(dbId: string): string {
+  return `semcache:index:${SEMCACHE_VERSION}:${dbId}`;
 }
 
+function hashKey(text: string, dbId: string): string {
+  const payload = `${SEMCACHE_VERSION}|${dbId}|` + text.toLowerCase().trim();
+  return (
+    "semcache:" +
+    crypto.createHash("sha256").update(payload).digest("hex").substring(0, 16)
+  );
+}
 
-
-export async function saveToCache(question: string, answer: string): Promise<void> {
+export async function saveToCache(
+  question: string,
+  answer: string,
+  dbId: string,
+): Promise<void> {
   try {
-    // Important: keep semantic cache free-tier friendly.
-    // Local embedding only (no LLM fingerprinting).
     const embedding = getLocalEmbedding(question);
-    const hasSignal = embedding.some(v => v > 0);
+    const hasSignal = embedding.some((v) => v > 0);
     if (!hasSignal) {
-      console.log('  [SemanticCache] Skip save — no embedding');
+      console.log("  [SemanticCache] Skip save — no embedding");
       return;
     }
 
     const redis = getRedis();
-    const key = hashKey(question);
+    const key = hashKey(question, dbId);
 
     await redis.set(
       key,
-      JSON.stringify({ question, answer, embedding }),
-      'EX',
-      CACHE_TTL
+      JSON.stringify({ question, answer, embedding, dbId }),
+      "EX",
+      CACHE_TTL,
     );
 
-    // Also add key to index set for scanning
-    await redis.sadd(SEMCACHE_INDEX_KEY, key);
-    console.log(`  [SemanticCache] Saved: "${question.substring(0, 50)}..."`);
-    
+    await redis.sadd(buildIndexKey(dbId), key);
+    console.log(
+      `  [SemanticCache/${dbId}] Saved: "${question.substring(0, 50)}..."`,
+    );
   } catch (err: unknown) {
-    console.error('[SemanticCache] Save failed:', err);
+    console.error("[SemanticCache] Save failed:", err);
   }
 }
 
-export async function checkCache(question: string): Promise<string | null> {
+export async function checkCache(
+  question: string,
+  dbId: string,
+): Promise<string | null> {
   try {
-    // Important: keep semantic cache free-tier friendly.
-    // Local embedding only (no LLM fingerprinting).
     const queryEmbedding = getLocalEmbedding(question);
-    const hasSignal = queryEmbedding.some(v => v > 0);
+    const hasSignal = queryEmbedding.some((v) => v > 0);
     if (!hasSignal) {
-      console.log('  [SemanticCache] MISS — no embedding');
+      console.log("  [SemanticCache] MISS — no embedding");
       return null;
     }
 
     const redis = getRedis();
 
-    // Check exact hash first
-    const exactKey = hashKey(question);
+    const exactKey = hashKey(question, dbId);
     const exact = await redis.get(exactKey);
     if (exact) {
       const parsed = JSON.parse(exact) as { answer: string };
-      console.log('  [SemanticCache] HIT (exact match)');
+      console.log(`  [SemanticCache/${dbId}] HIT (exact match)`);
       return parsed.answer;
     }
 
-    // Scan cached embeddings for semantic similarity.
-    // Performance: never iterate the full index set (can grow unbounded).
-    // Using SRANDMEMBER gives a bounded approximation while keeping latency stable.
-    const keysRaw = await redis.srandmember(SEMCACHE_INDEX_KEY, SEMCACHE_SCAN_KEYS);
+    const keysRaw = await redis.srandmember(
+      buildIndexKey(dbId),
+      SEMCACHE_SCAN_KEYS,
+    );
     const keys = Array.isArray(keysRaw) ? keysRaw : keysRaw ? [keysRaw] : [];
     let bestSim = 0;
     let bestAnswer: string | null = null;
-    let bestQuestion = '';
-    
+    let bestQuestion = "";
+
     for (const key of keys) {
       const raw = await redis.get(key);
       if (!raw) {
-        await redis.srem(SEMCACHE_INDEX_KEY, key);
+        await redis.srem(buildIndexKey(dbId), key);
         continue;
       }
 
-      const parsed = JSON.parse(raw) as { question: string; answer: string; embedding: number[] };
+      const parsed = JSON.parse(raw) as {
+        question: string;
+        answer: string;
+        embedding: number[];
+        dbId?: string;
+      };
       const sim = cosineSimilarity(queryEmbedding, parsed.embedding);
 
       if (sim > bestSim) {
@@ -95,14 +109,18 @@ export async function checkCache(question: string): Promise<string | null> {
     }
 
     if (bestSim >= SIMILARITY_THRESHOLD && bestAnswer) {
-      console.log(`  [SemanticCache] HIT (similarity: ${bestSim.toFixed(3)}, matched: "${bestQuestion.substring(0, 40)}...")`);
+      console.log(
+        `  [SemanticCache/${dbId}] HIT (similarity: ${bestSim.toFixed(3)}, matched: "${bestQuestion.substring(0, 40)}...")`,
+      );
       return bestAnswer;
     }
 
-    console.log(`  [SemanticCache] MISS (best similarity: ${bestSim.toFixed(3)}, threshold: ${SIMILARITY_THRESHOLD})`);
+    console.log(
+      `  [SemanticCache/${dbId}] MISS (best similarity: ${bestSim.toFixed(3)}, threshold: ${SIMILARITY_THRESHOLD})`,
+    );
     return null;
   } catch (err: unknown) {
-    console.error('[SemanticCache] Check failed:', err);
+    console.error("[SemanticCache] Check failed:", err);
     return null;
   }
 }

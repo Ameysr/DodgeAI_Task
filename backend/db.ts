@@ -12,11 +12,16 @@ import {
   closeAllDrivers,
   getDefaultDbId,
 } from "./db/connectionRegistry.js";
+import { getActiveDbId } from "./db/context.js";
 import type { QueryResult } from "./types/index.js";
 
-/** Returns the Neo4j driver for the current default DB. */
+function resolveActiveOrDefaultDbId(): string {
+  return getActiveDbId() ?? getDefaultDbId();
+}
+
+/** Returns the Neo4j driver for the current request DB, or the default DB. */
 export function getDriver(): Driver {
-  return getRegisteredDriver(getDefaultDbId());
+  return getRegisteredDriver(resolveActiveOrDefaultDbId());
 }
 
 /**
@@ -27,7 +32,7 @@ export async function runQuery(
   cypher: string,
   params: Record<string, unknown> = {},
 ): Promise<QueryResult[]> {
-  return runRegisteredQuery(getDefaultDbId(), cypher, params);
+  return runRegisteredQuery(resolveActiveOrDefaultDbId(), cypher, params);
 }
 
 /** Close all registered drivers — used during graceful shutdown. */
