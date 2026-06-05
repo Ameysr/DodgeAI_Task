@@ -1,58 +1,103 @@
-import type { O2CGraphState } from '../state.js';
-import type { FunctionResult } from '../../types/index.js';
-import { callLLM } from '../../services/llm.js';
-import { runQuery } from '../../db.js';
-import { validateCypher, enforceSizeLimit } from './guardrail.js';
-import { retrieveContext } from '../../services/graphRAG.js';
-import * as lookup from '../../functions/lookup.js';
-import * as traverse from '../../functions/traverse.js';
-import * as aggregate from '../../functions/aggregate.js';
-import * as detect from '../../functions/detect.js';
-import * as compare from '../../functions/compare.js';
-import * as meta from '../../functions/meta.js';
-import * as analytics from '../../functions/analytics.js';
-import { getValidNodeLabels, getValidRelationships } from '../../services/schemaAgent.js';
+import type { O2CGraphState } from "../state.js";
+import type { FunctionResult } from "../../types/index.js";
+import { callLLM } from "../../services/llm.js";
+import { runQuery } from "../../db.js";
+import { validateCypher, enforceSizeLimit } from "./guardrail.js";
+import { retrieveContext } from "../../services/graphRAG.js";
+import * as lookup from "../../functions/lookup.js";
+import * as traverse from "../../functions/traverse.js";
+import * as aggregate from "../../functions/aggregate.js";
+import * as detect from "../../functions/detect.js";
+import * as compare from "../../functions/compare.js";
+import * as meta from "../../functions/meta.js";
+import * as analytics from "../../functions/analytics.js";
+import {
+  getValidNodeLabels,
+  getValidRelationships,
+} from "../../services/schemaAgent.js";
 
 // Map function names to actual implementations
-const FUNCTION_MAP: Record<string, (...args: unknown[]) => Promise<FunctionResult>> = {
-  getCustomer: (p: unknown) => lookup.getCustomer((p as Record<string, string>).customerId),
-  getOrder: (p: unknown) => lookup.getOrder((p as Record<string, string>).orderId),
-  getProduct: (p: unknown) => lookup.getProduct((p as Record<string, string>).productId),
-  getBillingDoc: (p: unknown) => lookup.getBillingDoc((p as Record<string, string>).billingDocId),
-  getDelivery: (p: unknown) => lookup.getDelivery((p as Record<string, string>).deliveryId),
-  traceDocument: (p: unknown) => traverse.traceDocument((p as Record<string, string>).billingDocId),
-  getOrderDeliveries: (p: unknown) => traverse.getOrderDeliveries((p as Record<string, string>).orderId),
-  getDeliveryBilling: (p: unknown) => traverse.getDeliveryBilling((p as Record<string, string>).deliveryId),
-  traceOrderJourney: (p: unknown) => traverse.traceOrderJourney((p as Record<string, string>).orderId),
-  compareCustomerRevenue: (p: unknown) => compare.compareCustomerRevenue((p as Record<string, string>).customerId1, (p as Record<string, string>).customerId2),
-  compareCustomerOrders: (p: unknown) => compare.compareCustomerOrders((p as Record<string, string>).customerId1, (p as Record<string, string>).customerId2),
+const FUNCTION_MAP: Record<
+  string,
+  (...args: unknown[]) => Promise<FunctionResult>
+> = {
+  getCustomer: (p: unknown) =>
+    lookup.getCustomer((p as Record<string, string>).customerId),
+  getOrder: (p: unknown) =>
+    lookup.getOrder((p as Record<string, string>).orderId),
+  getProduct: (p: unknown) =>
+    lookup.getProduct((p as Record<string, string>).productId),
+  getBillingDoc: (p: unknown) =>
+    lookup.getBillingDoc((p as Record<string, string>).billingDocId),
+  getDelivery: (p: unknown) =>
+    lookup.getDelivery((p as Record<string, string>).deliveryId),
+  traceDocument: (p: unknown) =>
+    traverse.traceDocument((p as Record<string, string>).billingDocId),
+  getOrderDeliveries: (p: unknown) =>
+    traverse.getOrderDeliveries((p as Record<string, string>).orderId),
+  getDeliveryBilling: (p: unknown) =>
+    traverse.getDeliveryBilling((p as Record<string, string>).deliveryId),
+  traceOrderJourney: (p: unknown) =>
+    traverse.traceOrderJourney((p as Record<string, string>).orderId),
+  compareCustomerRevenue: (p: unknown) =>
+    compare.compareCustomerRevenue(
+      (p as Record<string, string>).customerId1,
+      (p as Record<string, string>).customerId2,
+    ),
+  compareCustomerOrders: (p: unknown) =>
+    compare.compareCustomerOrders(
+      (p as Record<string, string>).customerId1,
+      (p as Record<string, string>).customerId2,
+    ),
   getEntityTypesSummary: () => meta.getEntityTypesSummary(),
-  getSalesOrderItemToDeliveryItemJoinInfo: () => meta.getSalesOrderItemToDeliveryItemJoinInfo(),
-  getBusinessPartnerToBillingDocumentPath: () => meta.getBusinessPartnerToBillingDocumentPath(),
-  getDeliveryGoodsMovementStatusCounts: () => meta.getDeliveryGoodsMovementStatusCounts(),
-  traceSalesOrderToDeliveryAndBilling: (p: unknown) => meta.traceSalesOrderToDeliveryAndBilling((p as Record<string, string>).orderId),
-  getBillingItemsReferencingDelivery: (p: unknown) => meta.getBillingItemsReferencingDelivery((p as Record<string, string>).deliveryId),
+  getSalesOrderItemToDeliveryItemJoinInfo: () =>
+    meta.getSalesOrderItemToDeliveryItemJoinInfo(),
+  getBusinessPartnerToBillingDocumentPath: () =>
+    meta.getBusinessPartnerToBillingDocumentPath(),
+  getDeliveryGoodsMovementStatusCounts: () =>
+    meta.getDeliveryGoodsMovementStatusCounts(),
+  traceSalesOrderToDeliveryAndBilling: (p: unknown) =>
+    meta.traceSalesOrderToDeliveryAndBilling(
+      (p as Record<string, string>).orderId,
+    ),
+  getBillingItemsReferencingDelivery: (p: unknown) =>
+    meta.getBillingItemsReferencingDelivery(
+      (p as Record<string, string>).deliveryId,
+    ),
   getProductsWithMaxPlantCoverage: () => meta.getProductsWithMaxPlantCoverage(),
-  getCustomerBilledVsPaidBalance: (p: unknown) => meta.getCustomerBilledVsPaidBalance((p as Record<string, string>).customerId),
+  getCustomerBilledVsPaidBalance: (p: unknown) =>
+    meta.getCustomerBilledVsPaidBalance(
+      (p as Record<string, string>).customerId,
+    ),
   getPaymentsCollectedThisMonth: () => meta.getPaymentsCollectedThisMonth(),
   getDeliveriesNotBilled: () => meta.getDeliveriesNotBilled(),
   getOrderToPaymentCycleTime: () => meta.getOrderToPaymentCycleTime(),
-  getPaymentsWithoutJournalEntries: () => meta.getPaymentsWithoutJournalEntries(),
+  getPaymentsWithoutJournalEntries: () =>
+    meta.getPaymentsWithoutJournalEntries(),
   getPaymentsCollectedLastMonth: () => meta.getPaymentsCollectedLastMonth(),
   getSalesRevenueLastMonth: () => meta.getSalesRevenueLastMonth(),
-  getOrdersPlacedByCustomer: (p: unknown) => meta.getOrdersPlacedByCustomer((p as Record<string, string>).customerId),
-  getProductsStoredInPlant: (p: unknown) => meta.getProductsStoredInPlant((p as Record<string, string>).plantId),
+  getOrdersPlacedByCustomer: (p: unknown) =>
+    meta.getOrdersPlacedByCustomer((p as Record<string, string>).customerId),
+  getProductsStoredInPlant: (p: unknown) =>
+    meta.getProductsStoredInPlant((p as Record<string, string>).plantId),
   getCancelledInvoicesSummary: () => meta.getCancelledInvoicesSummary(),
   getO2CGraphSchemaDesign: () => meta.getO2CGraphSchemaDesign(),
-  analyzeBillingCancellationAnomaly: () => meta.analyzeBillingCancellationAnomaly(),
+  analyzeBillingCancellationAnomaly: () =>
+    meta.analyzeBillingCancellationAnomaly(),
   getProfitCenterToProductsTrace: () => meta.getProfitCenterToProductsTrace(),
   getTopProducts: (p: unknown) => {
     const params = p as Record<string, string>;
-    return aggregate.getTopProducts(params.metric ?? 'billing', Number(params.limit) || 10);
+    return aggregate.getTopProducts(
+      params.metric ?? "billing",
+      Number(params.limit) || 10,
+    );
   },
   getTopCustomers: (p: unknown) => {
     const params = p as Record<string, string>;
-    return aggregate.getTopCustomers(params.metric ?? 'orders', Number(params.limit) || 10);
+    return aggregate.getTopCustomers(
+      params.metric ?? "orders",
+      Number(params.limit) || 10,
+    );
   },
   getOrdersByOrg: (p: unknown) => {
     const params = p as Record<string, string>;
@@ -63,20 +108,37 @@ const FUNCTION_MAP: Record<string, (...args: unknown[]) => Promise<FunctionResul
   getShippingPointBreakdown: () => aggregate.getShippingPointBreakdown(),
   getSalesOrderValueByChannel: () => aggregate.getSalesOrderValueByChannel(),
   getBillingDocsByCreationDate: () => aggregate.getBillingDocsByCreationDate(),
-  getTopActiveBillingMonthRevenue: () => aggregate.getTopActiveBillingMonthRevenue(),
-  getTopDeliveriesByProductCount: (p: unknown) => aggregate.getTopDeliveriesByProductCount(Number((p as Record<string, string>).limit) || 10),
+  getTopActiveBillingMonthRevenue: () =>
+    aggregate.getTopActiveBillingMonthRevenue(),
+  getTopDeliveriesByProductCount: (p: unknown) =>
+    aggregate.getTopDeliveriesByProductCount(
+      Number((p as Record<string, string>).limit) || 10,
+    ),
   getSoLineItemStats: () => aggregate.getSoLineItemStats(),
-  getAllCustomersWithOrderCounts: (p: unknown) => aggregate.getAllCustomersWithOrderCounts(Number((p as Record<string, string>).limit) || 50),
+  getAllCustomersWithOrderCounts: (p: unknown) =>
+    aggregate.getAllCustomersWithOrderCounts(
+      Number((p as Record<string, string>).limit) || 50,
+    ),
   getMaterialGroupsAnalysis: () => aggregate.getMaterialGroupsAnalysis(),
-  getUniqueMaterialsOrderedVsBilled: () => aggregate.getUniqueMaterialsOrderedVsBilled(),
-  getDeliveryCompletionPerCustomer: () => aggregate.getDeliveryCompletionPerCustomer(),
-  getTopMaterialsByBilledQuantity: (p: unknown) => aggregate.getTopMaterialsByBilledQuantity(Number((p as Record<string, string>).limit) || 10),
-  getSalesOrderWithMostLineItems: () => aggregate.getSalesOrderWithMostLineItems(),
+  getUniqueMaterialsOrderedVsBilled: () =>
+    aggregate.getUniqueMaterialsOrderedVsBilled(),
+  getDeliveryCompletionPerCustomer: () =>
+    aggregate.getDeliveryCompletionPerCustomer(),
+  getTopMaterialsByBilledQuantity: (p: unknown) =>
+    aggregate.getTopMaterialsByBilledQuantity(
+      Number((p as Record<string, string>).limit) || 10,
+    ),
+  getSalesOrderWithMostLineItems: () =>
+    aggregate.getSalesOrderWithMostLineItems(),
   getPaymentCollectionRate: () => aggregate.getPaymentCollectionRate(),
-  findBrokenFlows: (p: unknown) => detect.findBrokenFlows((p as Record<string, string>).type ?? 'undelivered'),
-  getUnpaidInvoices: (p: unknown) => detect.getUnpaidInvoices(Number((p as Record<string, string>).limit) || 10),
-  getCancelledDocs: (p: unknown) => detect.getCancelledDocs(Number((p as Record<string, string>).limit) || 10),
-  getCustomerBillingSummary: (p: unknown) => detect.getCustomerBillingSummary((p as Record<string, string>).customerId),
+  findBrokenFlows: (p: unknown) =>
+    detect.findBrokenFlows((p as Record<string, string>).type ?? "undelivered"),
+  getUnpaidInvoices: (p: unknown) =>
+    detect.getUnpaidInvoices(Number((p as Record<string, string>).limit) || 10),
+  getCancelledDocs: (p: unknown) =>
+    detect.getCancelledDocs(Number((p as Record<string, string>).limit) || 10),
+  getCustomerBillingSummary: (p: unknown) =>
+    detect.getCustomerBillingSummary((p as Record<string, string>).customerId),
   getCancelledAfterPayment: () => detect.getCancelledAfterPayment(),
   getCustomersWithoutBilling: () => detect.getCustomersWithoutBilling(),
   getProductsNeverDelivered: () => detect.getProductsNeverDelivered(),
@@ -92,16 +154,21 @@ const FUNCTION_MAP: Record<string, (...args: unknown[]) => Promise<FunctionResul
   getMaterialsNeverDelivered: () => detect.getMaterialsNeverDelivered(),
   getSystemPipelineDescription: (p: unknown) => {
     const params = p as Record<string, string>;
-    return meta.getSystemPipelineDescription(params.mentionedQuery, params.entities ? JSON.parse(params.entities) : undefined);
+    return meta.getSystemPipelineDescription(
+      params.mentionedQuery,
+      params.entities ? JSON.parse(params.entities) : undefined,
+    );
   },
   // ── ANALYTICS (formerly null-function plans) ──
   getO2CHealthSummary: () => analytics.getO2CHealthSummary(),
   getARAgingBuckets: () => analytics.getARAgingBuckets(),
   getDSOPerCustomer: () => analytics.getDSOPerCustomer(),
   getCreditExposure: () => analytics.getCreditExposure(),
-  getCancellationRateByCustomer: () => analytics.getCancellationRateByCustomer(),
+  getCancellationRateByCustomer: () =>
+    analytics.getCancellationRateByCustomer(),
   getCurrencyAnalysis: () => analytics.getCurrencyAnalysis(),
-  getBlockedCustomersWithOrders: () => analytics.getBlockedCustomersWithOrders(),
+  getBlockedCustomersWithOrders: () =>
+    analytics.getBlockedCustomersWithOrders(),
   getCustomerOrderRecency: () => analytics.getCustomerOrderRecency(),
   getDeliveryLeadTime: () => analytics.getDeliveryLeadTime(),
   getOverdueDeliveries: () => analytics.getOverdueDeliveries(),
@@ -113,7 +180,8 @@ const FUNCTION_MAP: Record<string, (...args: unknown[]) => Promise<FunctionResul
   getOrderValueDistribution: () => analytics.getOrderValueDistribution(),
   getDeliveryStatusBreakdown: () => analytics.getDeliveryStatusBreakdown(),
   getIncotermsAnalysis: () => analytics.getIncotermsAnalysis(),
-  getArchivingVsBlockedAnalysis: () => analytics.getArchivingVsBlockedAnalysis(),
+  getArchivingVsBlockedAnalysis: () =>
+    analytics.getArchivingVsBlockedAnalysis(),
 };
 
 // ── SCHEMA-AWARE CYPHER VALIDATION ────────────────────────────────────────────
@@ -122,27 +190,55 @@ const FUNCTION_MAP: Record<string, (...args: unknown[]) => Promise<FunctionResul
 // Uses LIVE schema from SchemaAgent when available, falls back to hardcoded sets.
 
 const HARDCODED_NODE_LABELS = new Set([
-  'Customer', 'SalesOrder', 'SalesOrderItem', 'ScheduleLine', 'Product',
-  'DeliveryHeader', 'DeliveryItem', 'BillingHeader', 'BillingItem',
-  'BillingCancellation', 'JournalEntry', 'Payment', 'Plant', 'Address',
-  'CustomerCompany', 'CustomerSalesArea', 'ProductPlant',
-  'ProductDescription', 'ProductStorageLocation',
+  "Customer",
+  "SalesOrder",
+  "SalesOrderItem",
+  "ScheduleLine",
+  "Product",
+  "DeliveryHeader",
+  "DeliveryItem",
+  "BillingHeader",
+  "BillingItem",
+  "BillingCancellation",
+  "JournalEntry",
+  "Payment",
+  "Plant",
+  "Address",
+  "CustomerCompany",
+  "CustomerSalesArea",
+  "ProductPlant",
+  "ProductDescription",
+  "ProductStorageLocation",
 ]);
 
 const HARDCODED_RELATIONSHIPS = new Set([
-  'PLACED', 'HAS_ITEM', 'HAS_SCHEDULE_LINE', 'REFERENCES', 'FULFILLED_BY',
-  'PART_OF', 'AT_PLANT', 'BILLED_IN', 'POSTED_AS', 'PAID_BY', 'CANCELS',
-  'HAS_ADDRESS', 'ASSIGNED_TO_COMPANY', 'SELLS_THROUGH', 'STOCKED_AT', 'IN_PLANT',
-  'HAS_DESCRIPTION', 'FOR_PRODUCT',
+  "PLACED",
+  "HAS_ITEM",
+  "HAS_SCHEDULE_LINE",
+  "REFERENCES",
+  "FULFILLED_BY",
+  "PART_OF",
+  "AT_PLANT",
+  "BILLED_IN",
+  "POSTED_AS",
+  "PAID_BY",
+  "CANCELS",
+  "HAS_ADDRESS",
+  "ASSIGNED_TO_COMPANY",
+  "SELLS_THROUGH",
+  "STOCKED_AT",
+  "IN_PLANT",
+  "HAS_DESCRIPTION",
+  "FOR_PRODUCT",
 ]);
 
-function getEffectiveNodeLabels(): Set<string> {
-  const live = getValidNodeLabels();
+function getEffectiveNodeLabels(dbId: string): Set<string> {
+  const live = getValidNodeLabels(dbId);
   return live.size > 0 ? live : HARDCODED_NODE_LABELS;
 }
 
-function getEffectiveRelationships(): Set<string> {
-  const live = getValidRelationships();
+function getEffectiveRelationships(dbId: string): Set<string> {
+  const live = getValidRelationships(dbId);
   return live.size > 0 ? live : HARDCODED_RELATIONSHIPS;
 }
 
@@ -181,33 +277,36 @@ COMMON MISTAKES TO AVOID:
 // ── CYPHER AUTO-REPAIR ────────────────────────────────────────────────────────
 // Fixes common LLM mistakes before schema validation, avoiding wasted retries.
 const RELATIONSHIP_REPAIRS: Record<string, string> = {
-  'HAS': 'HAS_ITEM',
-  'CONTAINS': 'HAS_ITEM',
-  'HAS_ITEMS': 'HAS_ITEM',
-  'DELIVERS': 'FULFILLED_BY',
-  'DELIVERED_BY': 'FULFILLED_BY',
-  'FULFILLS': 'FULFILLED_BY',
-  'BELONGS_TO': 'PART_OF',
-  'MEMBER_OF': 'PART_OF',
-  'IN': 'PART_OF',
-  'BILLED': 'BILLED_IN',
-  'INVOICED': 'BILLED_IN',
-  'INVOICED_IN': 'BILLED_IN',
-  'PAYS': 'PAID_BY',
-  'PAYMENT': 'PAID_BY',
-  'ORDERED_BY': 'PLACED',
-  'ORDERS': 'PLACED',
-  'POSTED': 'POSTED_AS',
-  'JOURNAL': 'POSTED_AS',
-  'STOCKED': 'STOCKED_AT',
-  'AT': 'AT_PLANT',
-  'CANCELLED': 'CANCELS',
-  'CANCELLED_BY': 'CANCELS',
-  'REFERS_TO': 'REFERENCES',
-  'FOR': 'REFERENCES',
+  HAS: "HAS_ITEM",
+  CONTAINS: "HAS_ITEM",
+  HAS_ITEMS: "HAS_ITEM",
+  DELIVERS: "FULFILLED_BY",
+  DELIVERED_BY: "FULFILLED_BY",
+  FULFILLS: "FULFILLED_BY",
+  BELONGS_TO: "PART_OF",
+  MEMBER_OF: "PART_OF",
+  IN: "PART_OF",
+  BILLED: "BILLED_IN",
+  INVOICED: "BILLED_IN",
+  INVOICED_IN: "BILLED_IN",
+  PAYS: "PAID_BY",
+  PAYMENT: "PAID_BY",
+  ORDERED_BY: "PLACED",
+  ORDERS: "PLACED",
+  POSTED: "POSTED_AS",
+  JOURNAL: "POSTED_AS",
+  STOCKED: "STOCKED_AT",
+  AT: "AT_PLANT",
+  CANCELLED: "CANCELS",
+  CANCELLED_BY: "CANCELS",
+  REFERS_TO: "REFERENCES",
+  FOR: "REFERENCES",
 };
 
-function autoRepairCypher(cypher: string): { repaired: string; fixes: string[] } {
+function autoRepairCypher(cypher: string): {
+  repaired: string;
+  fixes: string[];
+} {
   const fixes: string[] = [];
   let repaired = cypher;
 
@@ -225,7 +324,7 @@ function autoRepairCypher(cypher: string): { repaired: string; fixes: string[] }
   return { repaired, fixes };
 }
 
-function validateCypherSchema(cypher: string): string[] {
+function validateCypherSchema(cypher: string, dbId: string): string[] {
   const warnings: string[] = [];
 
   // Check node labels — extract (:LabelName) patterns (inside parentheses only)
@@ -236,9 +335,32 @@ function validateCypherSchema(cypher: string): string[] {
     const label = labelMatch?.[1];
     if (!label) continue;
     // Skip Neo4j built-in labels and type casts
-    if (['DISTINCT', 'NOT', 'NULL', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AND', 'OR', 'DESC', 'ASC', 'WITH', 'MATCH', 'RETURN', 'ORDER'].includes(label)) continue;
-    if (!getEffectiveNodeLabels().has(label)) {
-      warnings.push(`Unknown node label "${label}" — valid labels: ${[...getEffectiveNodeLabels()].slice(0, 5).join(', ')}...`);
+    if (
+      [
+        "DISTINCT",
+        "NOT",
+        "NULL",
+        "WHERE",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
+        "AND",
+        "OR",
+        "DESC",
+        "ASC",
+        "WITH",
+        "MATCH",
+        "RETURN",
+        "ORDER",
+      ].includes(label)
+    )
+      continue;
+    if (!getEffectiveNodeLabels(dbId).has(label)) {
+      warnings.push(
+        `Unknown node label "${label}" — valid labels: ${[...getEffectiveNodeLabels(dbId)].slice(0, 5).join(", ")}...`,
+      );
     }
   }
 
@@ -246,15 +368,20 @@ function validateCypherSchema(cypher: string): string[] {
   const relMatches = cypher.match(/\[(?:\w+)?:\s*([A-Z_]+)\]/g) || [];
   for (const match of relMatches) {
     const rel = match.match(/:\s*([A-Z_]+)/)?.[1];
-    if (rel && !getEffectiveRelationships().has(rel)) {
-      warnings.push(`Unknown relationship type "${rel}" — valid types: ${[...getEffectiveRelationships()].slice(0, 5).join(', ')}...`);
+    if (rel && !getEffectiveRelationships(dbId).has(rel)) {
+      warnings.push(
+        `Unknown relationship type "${rel}" — valid types: ${[...getEffectiveRelationships(dbId)].slice(0, 5).join(", ")}...`,
+      );
     }
   }
 
   // Check for sum/avg on string amount fields without toFloat()
-  const unsafeAggPattern = /(?:sum|avg)\s*\(\s*(?!toFloat)\s*\w+\.\s*(?:totalNetAmount|netAmount|amountInTransactionCurrency|totalAmount)\s*\)/gi;
+  const unsafeAggPattern =
+    /(?:sum|avg)\s*\(\s*(?!toFloat)\s*\w+\.\s*(?:totalNetAmount|netAmount|amountInTransactionCurrency|totalAmount)\s*\)/gi;
   if (unsafeAggPattern.test(cypher)) {
-    warnings.push('Amount field used in SUM/AVG without toFloat() — will produce string concatenation instead of arithmetic');
+    warnings.push(
+      "Amount field used in SUM/AVG without toFloat() — will produce string concatenation instead of arithmetic",
+    );
   }
 
   return warnings;
@@ -285,10 +412,15 @@ function extractCypherFromResponse(responseText: string): CypherGenResult {
   }
 
   // Attempt 2: Extract JSON block from mixed response
-  const jsonMatch = responseText.match(/\{[\s\S]*?"cypher"\s*:\s*"[\s\S]*?"\s*\}/);
+  const jsonMatch = responseText.match(
+    /\{[\s\S]*?"cypher"\s*:\s*"[\s\S]*?"\s*\}/,
+  );
   if (jsonMatch) {
     try {
-      const parsed = JSON.parse(jsonMatch[0]) as { cypher?: string; reasoning?: string };
+      const parsed = JSON.parse(jsonMatch[0]) as {
+        cypher?: string;
+        reasoning?: string;
+      };
       if (parsed.cypher) {
         return { cypher: parsed.cypher, reasoning: parsed.reasoning ?? null };
       }
@@ -298,21 +430,21 @@ function extractCypherFromResponse(responseText: string): CypherGenResult {
   }
 
   // Attempt 3: Extract raw MATCH...RETURN from response text
-  const cypherMatch = responseText.match(/MATCH[\s\S]+?(?:RETURN|LIMIT)[\s\S]*$/im);
+  const cypherMatch = responseText.match(
+    /MATCH[\s\S]+?(?:RETURN|LIMIT)[\s\S]*$/im,
+  );
   if (cypherMatch) {
     return { cypher: cypherMatch[0], reasoning: null };
   }
 
-  throw new Error('Could not extract Cypher from LLM response');
+  throw new Error("Could not extract Cypher from LLM response");
 }
 
-
 export async function hybridExecutor(
-  state: O2CGraphState
+  state: O2CGraphState,
 ): Promise<Partial<O2CGraphState>> {
-
   // PATH A: Function execution
-  if (state.pathTaken === 'function' && state.selectedFunction) {
+  if (state.pathTaken === "function" && state.selectedFunction) {
     const fn = FUNCTION_MAP[state.selectedFunction.name];
     if (fn) {
       try {
@@ -320,37 +452,41 @@ export async function hybridExecutor(
         if (result.records.length === 0 && state.retryCount < 3) {
           return {
             retryCount: state.retryCount + 1,
-            queryError: 'No results found',
+            queryError: "No results found",
           };
         }
         return {
           queryResults: result.records,
-          confidence: 'high',
+          confidence: "high",
           queryError: null,
         };
       } catch (err: unknown) {
         if (state.retryCount < 3) {
           return {
             retryCount: state.retryCount + 1,
-            queryError: err instanceof Error ? err.message : 'Function execution failed',
+            queryError:
+              err instanceof Error ? err.message : "Function execution failed",
           };
         }
         return {
-          answer: "I wasn't able to find reliable data for this. Try rephrasing with a specific ID or entity name.",
-          confidence: 'low',
+          answer:
+            "I wasn't able to find reliable data for this. Try rephrasing with a specific ID or entity name.",
+          confidence: "low",
         };
       }
     } else {
       // Function not found in FUNCTION_MAP (likely functionName is null).
       // Fall through to dynamic Cypher generation — mark path accordingly
       // so the contract verifier knows NOT to check field names.
-      console.log(`  [Executor] Function "${state.selectedFunction.name}" not in FUNCTION_MAP — falling through to Cypher generation`);
-      state = { ...state, pathTaken: 'template' };
+      console.log(
+        `  [Executor] Function "${state.selectedFunction.name}" not in FUNCTION_MAP — falling through to Cypher generation`,
+      );
+      state = { ...state, pathTaken: "template" };
     }
   }
 
   // PATH B & C: Template / Constrained Cypher generation with GraphRAG
-  const isConstrained = state.pathTaken === 'constrained';
+  const isConstrained = state.pathTaken === "constrained";
   const isRetry = state.retryCount > 0;
   const retryNum = state.retryCount;
 
@@ -360,51 +496,71 @@ export async function hybridExecutor(
   //   Retry 1:   Force CoT reasoning + more examples + explicit error analysis
   //   Retry 2:   Escalate to Tier 3 (deepseek-reasoner) + simplified prompt
   //   Retry 3:   Query decomposition — break into sub-queries
-  
+
   // Retry 3: Try query decomposition as last resort
   if (retryNum >= 3) {
     console.log(`  [Executor] Retry #3 — attempting query decomposition`);
-    const { needsDecomposition: shouldDecompose, decomposeAndExecute } = await import('./queryDecomposer.js');
-    
+    const { needsDecomposition: shouldDecompose, decomposeAndExecute } =
+      await import("./queryDecomposer.js");
+
     try {
       const decomposition = await decomposeAndExecute(
+        state.dbId,
         state.resolvedMessage,
-        state.extractedEntities as Record<string, string>
+        state.extractedEntities as Record<string, string>,
       );
-      
-      if (decomposition.wasDecomposed && decomposition.mergedResults.length > 0) {
-        console.log(`  [Executor] Decomposition successful: ${decomposition.mergedResults.length} total results from ${decomposition.subQueries.length} sub-queries`);
+
+      if (
+        decomposition.wasDecomposed &&
+        decomposition.mergedResults.length > 0
+      ) {
+        console.log(
+          `  [Executor] Decomposition successful: ${decomposition.mergedResults.length} total results from ${decomposition.subQueries.length} sub-queries`,
+        );
         return {
           queryResults: decomposition.mergedResults,
-          confidence: 'medium',
+          confidence: "medium",
           queryError: null,
-          executedCypher: decomposition.subQueries.map(sq => sq.cypher).join('\n---\n'),
+          executedCypher: decomposition.subQueries
+            .map((sq) => sq.cypher)
+            .join("\n---\n"),
         };
       }
 
       if (decomposition.errors.length > 0) {
-        console.log(`  [Executor] Decomposition errors: ${decomposition.errors.join('; ')}`);
+        console.log(
+          `  [Executor] Decomposition errors: ${decomposition.errors.join("; ")}`,
+        );
       }
     } catch (err) {
-      console.log(`  [Executor] Decomposition failed: ${(err as Error).message}`);
+      console.log(
+        `  [Executor] Decomposition failed: ${(err as Error).message}`,
+      );
     }
 
     return {
-      answer: "I wasn't able to find reliable data for this question after trying multiple approaches. Try breaking your question into simpler parts, e.g., ask about orders and payments separately.",
-      confidence: 'low',
+      answer:
+        "I wasn't able to find reliable data for this question after trying multiple approaches. Try breaking your question into simpler parts, e.g., ask about orders and payments separately.",
+      confidence: "low",
     };
   }
 
   // ── Determine tier and example count based on retry level ──
   // Retry 0: Tier 2, 5 examples
-  // Retry 1: Tier 2 + CoT, 7 examples  
+  // Retry 1: Tier 2 + CoT, 7 examples
   // Retry 2: Tier 3 (deepseek-reasoner), 7 examples + simplified approach
-  const tier = (retryNum >= 2 || isConstrained) ? 3 : 2;
+  const tier = retryNum >= 2 || isConstrained ? 3 : 2;
   const exampleCount = retryNum >= 1 ? 7 : 5;
 
   // ── GraphRAG: Retrieve similar examples + targeted schema ──
-  const ragContext = await retrieveContext(state.resolvedMessage, exampleCount);
-  console.log(`  [GraphRAG] Using schema subset (${ragContext.matchedExamples.length} examples) instead of full 135-line schema`);
+  const ragContext = await retrieveContext(
+    state.dbId,
+    state.resolvedMessage,
+    exampleCount,
+  );
+  console.log(
+    `  [GraphRAG] Using schema subset (${ragContext.matchedExamples.length} examples) instead of full 135-line schema`,
+  );
 
   // ── BUILD SYSTEM PROMPT ──
   // Base instructions (always included)
@@ -461,7 +617,7 @@ Include your reasoning in the JSON response.`;
     systemPrompt += `
 
 ⚠️ RETRY #1 — YOUR FIRST QUERY ATTEMPT FAILED:
-Failed Cypher: ${state.executedCypher ?? 'unknown'}
+Failed Cypher: ${state.executedCypher ?? "unknown"}
 Error: ${state.queryError}
 
 DIAGNOSE THE ROOT CAUSE:
@@ -475,13 +631,12 @@ MANDATORY: You MUST write a FUNDAMENTALLY DIFFERENT query. Do NOT make minor twe
 - If you used property filtering, try relationship-based traversal
 - If you used an aggregation, try returning raw data first
 - Consider using OPTIONAL MATCH instead of MATCH for potentially missing relationships`;
-
   } else if (retryNum === 2 && state.queryError) {
     // Retry 2: Simplified approach (escalated to Tier 3 deepseek-reasoner)
     systemPrompt += `
 
 🔴 RETRY #2 (FINAL ATTEMPT) — BOTH PREVIOUS QUERIES FAILED:
-Last failed Cypher: ${state.executedCypher ?? 'unknown'}
+Last failed Cypher: ${state.executedCypher ?? "unknown"}
 Last error: ${state.queryError}
 
 YOU ARE NOW USING THE MOST POWERFUL MODEL. Write the simplest possible Cypher that captures the core of the user's question:
@@ -510,15 +665,18 @@ RESPONSE FORMAT — respond with ONLY valid JSON:
   // ── CONVERSATION CONTEXT ──────────────────────────────────────────────────
   // Inject last 2 Q&A pairs so the LLM understands multi-turn context.
   // E.g., "What about their deliveries?" after asking about a customer.
-  let conversationContext = '';
+  let conversationContext = "";
   if (state.history && state.history.length > 0) {
     const recentPairs = state.history.slice(-4); // last 2 Q&A pairs (4 messages)
     conversationContext = recentPairs
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.substring(0, 150)}`)
-      .join('\n');
+      .map(
+        (m) =>
+          `${m.role === "user" ? "User" : "Assistant"}: ${m.content.substring(0, 150)}`,
+      )
+      .join("\n");
   }
 
-  const userPrompt = `${conversationContext ? `Recent conversation context:\n${conversationContext}\n\n` : ''}Question: "${state.resolvedMessage}"
+  const userPrompt = `${conversationContext ? `Recent conversation context:\n${conversationContext}\n\n` : ""}Question: "${state.resolvedMessage}"
 Extracted entities: ${JSON.stringify(state.extractedEntities)}`;
 
   try {
@@ -527,7 +685,7 @@ Extracted entities: ${JSON.stringify(state.extractedEntities)}`;
       userPrompt,
       tier: tier as 1 | 2 | 3,
       maxTokens: isConstrained || isRetry ? 800 : 500,
-      callerTag: `cypher-gen-t${tier}${isRetry ? '-retry' + retryNum : ''}`,
+      callerTag: `cypher-gen-t${tier}${isRetry ? "-retry" + retryNum : ""}`,
     });
 
     // ── EXTRACT CYPHER + REASONING ──
@@ -535,7 +693,9 @@ Extracted entities: ${JSON.stringify(state.extractedEntities)}`;
 
     // Log reasoning for audit trail
     if (result.reasoning) {
-      console.log(`  [CypherGen] Reasoning: ${result.reasoning.substring(0, 200)}${result.reasoning.length > 200 ? '...' : ''}`);
+      console.log(
+        `  [CypherGen] Reasoning: ${result.reasoning.substring(0, 200)}${result.reasoning.length > 200 ? "..." : ""}`,
+      );
     }
 
     const validation = validateCypher(result.cypher);
@@ -549,25 +709,28 @@ Extracted entities: ${JSON.stringify(state.extractedEntities)}`;
         };
       }
       return {
-        answer: "I wasn't able to generate a safe query for this question. Please try rephrasing.",
-        confidence: 'low',
+        answer:
+          "I wasn't able to generate a safe query for this question. Please try rephrasing.",
+        confidence: "low",
       };
     }
 
     // ── AUTO-REPAIR common LLM mistakes ──
     const { repaired, fixes } = autoRepairCypher(result.cypher);
     if (fixes.length > 0) {
-      console.log(`  [AutoRepair] Fixed ${fixes.length} relationship(s): ${fixes.join(', ')}`);
+      console.log(
+        `  [AutoRepair] Fixed ${fixes.length} relationship(s): ${fixes.join(", ")}`,
+      );
       result.cypher = repaired;
     }
 
     // ── SCHEMA-AWARE VALIDATION ──
-    const schemaIssues = validateCypherSchema(result.cypher);
+    const schemaIssues = validateCypherSchema(result.cypher, state.dbId);
     if (schemaIssues.length > 0 && state.retryCount < 3) {
-      console.log(`  [Executor] Schema issues: ${schemaIssues.join('; ')}`);
+      console.log(`  [Executor] Schema issues: ${schemaIssues.join("; ")}`);
       return {
         retryCount: state.retryCount + 1,
-        queryError: `Schema validation issues: ${schemaIssues.join('; ')}. Fix these before running the query.`,
+        queryError: `Schema validation issues: ${schemaIssues.join("; ")}. Fix these before running the query.`,
         executedCypher: result.cypher,
       };
     }
@@ -575,7 +738,9 @@ Extracted entities: ${JSON.stringify(state.extractedEntities)}`;
     // Layer 5: Enforce size limit
     result.cypher = enforceSizeLimit(result.cypher);
 
-    console.log(`  [Executor] Generated Cypher (attempt ${retryNum}): ${result.cypher}`);
+    console.log(
+      `  [Executor] Generated Cypher (attempt ${retryNum}): ${result.cypher}`,
+    );
     const records = await runQuery(result.cypher, {});
 
     if (records.length === 0 && state.retryCount < 3) {
@@ -588,7 +753,7 @@ Extracted entities: ${JSON.stringify(state.extractedEntities)}`;
 
     return {
       queryResults: records,
-      confidence: isConstrained ? 'low' : 'medium',
+      confidence: isConstrained ? "low" : "medium",
       queryError: null,
       usedFallback: response.usedFallback,
       executedCypher: result.cypher,
@@ -597,13 +762,14 @@ Extracted entities: ${JSON.stringify(state.extractedEntities)}`;
     if (state.retryCount < 3) {
       return {
         retryCount: state.retryCount + 1,
-        queryError: err instanceof Error ? err.message : 'Query generation failed',
+        queryError:
+          err instanceof Error ? err.message : "Query generation failed",
       };
     }
     return {
-      answer: "I wasn't able to find reliable data for this. Try rephrasing with a specific ID or entity name.",
-      confidence: 'low',
+      answer:
+        "I wasn't able to find reliable data for this. Try rephrasing with a specific ID or entity name.",
+      confidence: "low",
     };
   }
 }
-

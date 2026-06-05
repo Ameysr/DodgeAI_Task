@@ -1,163 +1,121 @@
-// ── GraphRAG: Few-Shot Retriever + Schema Selector ────────────────────────────
-// Production-grade: Embeds curated query library at startup, retrieves top-K
-// similar examples at query time, and builds a mini-schema for the LLM.
+// ── GraphRAG: Per-DB Few-Shot Retriever + Schema Selector ───────────────────
+// Retrieves DB-specific example queries and builds a targeted live-schema
+// context for the LLM. Works for both the original SAP graph and any newly
+// registered database that has been schema-discovered.
 
-import { getLocalEmbedding } from './embedding.js';
-import { cosineSimilarity } from '../utils/math.js';
-import { QUERY_LIBRARY, type QueryExample } from './queryLibrary.js';
-import { getLiveSchema, getFormattedNodeSchema, getRelationshipsForNode, getAllFormattedSchemas, getAllRelationshipStrings } from './schemaAgent.js';
+import { getLocalEmbedding } from "./embedding.js";
+import { cosineSimilarity } from "../utils/math.js";
+import { getQueryLibraryForDb } from "./exampleGenerator.js";
+import {
+  discoverSchema,
+  getLiveSchema,
+  getFormattedNodeSchema,
+  getRelationshipsForNode,
+  getAllFormattedSchemas,
+  getAllRelationshipStrings,
+} from "./schemaAgent.js";
+import { DEFAULT_DB_ID } from "../db/connectionRegistry.js";
+import type { QueryExample } from "./queryLibrary.js";
 
-// ── SCHEMA FRAGMENTS ──────────────────────────────────────────────────────────
-// Each node type's schema as a string — only the relevant ones are sent to LLM
-const NODE_SCHEMAS: Record<string, string> = {
-  Customer: 'Customer {id(string, e.g. "320000083"), businessPartnerFullName(string), businessPartnerName(string), businessPartnerIsBlocked(boolean), customer(string), creationDate(string)}',
-  SalesOrder: 'SalesOrder {id(string), salesOrder(string, e.g. "740586"), soldToParty(string = customer id), totalNetAmount(string — use toFloat()), transactionCurrency(string, e.g. "INR"), salesOrganization(string, e.g. "IN01"), creationDate(string, e.g. "2025-04-10"), overallDeliveryStatus(string), overallOrdReltdBillgStatus(string), customerPaymentTerms(string, e.g. "Z001"/"Z009"), incotermsClassification(string), distributionChannel(string), requestedDeliveryDate(string), organizationDivision(string, e.g. "99")}',
-  SalesOrderItem: 'SalesOrderItem {id(string = salesOrder_salesOrderItem), salesOrder(string), salesOrderItem(string, e.g. "10"), material(string), netAmount(string — use toFloat()), materialGroup(string), requestedQuantity(string — use toFloat())}',
-  ScheduleLine: 'ScheduleLine {id(string), salesOrder(string), salesOrderItem(string), scheduleLine(string), confirmedDeliveryDate(string)}',
-  Product: 'Product {id(string), product(string, e.g. "MZ-FG-S300"), productDescription(string), productGroup(string)}',
-  DeliveryHeader: 'DeliveryHeader {id(string), deliveryDocument(string, e.g. "800066830"), creationDate(string), deliveryDate(string), shippingPoint(string), overallGoodsMovementStatus(string, "A"=not moved, "C"=complete)}',
-  DeliveryItem: 'DeliveryItem {id(string), deliveryDocument(string), deliveryDocumentItem(string), plant(string, e.g. "WB05"), referenceSdDocument(string = original salesOrder), actualDeliveryQuantity(string)}',
-  BillingHeader: 'BillingHeader {id(string), billingDocument(string, e.g. "91150188"), billingDocumentType(string — F2=invoice, S1=cancellation), totalNetAmount(string — use toFloat()), transactionCurrency(string), billingDocumentDate(string), creationDate(string), accountingDocument(string), soldToParty(string = customer id), billingDocumentIsCancelled(boolean)}',
-  BillingItem: 'BillingItem {id(string), billingDocument(string), billingDocumentItem(string), material(string), netAmount(string — use toFloat()), referenceSdDocument(string)}',
-  BillingCancellation: 'BillingCancellation {id(string), billingDocument(string), cancelledBillingDocument(string), totalNetAmount(string)}',
-  JournalEntry: 'JournalEntry {id(string), accountingDocument(string), accountingDocumentItem(string), companyCode(string, e.g. "ABCD"), fiscalYear(string, e.g. "2025"), glAccount(string), amountInTransactionCurrency(string — use toFloat()), postingDate(string)}',
-  Payment: 'Payment {id(string), accountingDocument(string), accountingDocumentItem(string), clearingDate(string), amountInTransactionCurrency(string — use toFloat()), customer(string)}',
-  Plant: 'Plant {id(string), plant(string, e.g. "WB05"), plantName(string)}',
-  Address: 'Address {id(string), businessPartner(string), cityName(string), country(string), postalCode(string)}',
-  CustomerCompany: 'CustomerCompany {id(string), customer(string), companyCode(string)}',
-  CustomerSalesArea: 'CustomerSalesArea {id(string), customer(string), salesOrganization(string)}',
-  ProductPlant: 'ProductPlant {id(string), product(string), plant(string), profitCenter(string)}',
-  ProductDescription: 'ProductDescription {id(string), product(string), language(string), productDescription(string)}',
-  ProductStorageLocation: 'ProductStorageLocation {id(string), product(string), plant(string), storageLocation(string)}',
-};
-
-// Relationships that involve specific node types
-const RELATIONSHIP_MAP: Record<string, string[]> = {
-  Customer: ['(Customer)-[:PLACED]->(SalesOrder)', '(Customer)-[:HAS_ADDRESS]->(Address)', '(Customer)-[:ASSIGNED_TO_COMPANY]->(CustomerCompany)', '(Customer)-[:SELLS_THROUGH]->(CustomerSalesArea)'],
-  SalesOrder: ['(Customer)-[:PLACED]->(SalesOrder)', '(SalesOrder)-[:HAS_ITEM]->(SalesOrderItem)'],
-  SalesOrderItem: ['(SalesOrder)-[:HAS_ITEM]->(SalesOrderItem)', '(SalesOrderItem)-[:HAS_SCHEDULE_LINE]->(ScheduleLine)', '(SalesOrderItem)-[:REFERENCES]->(Product)', '(SalesOrderItem)-[:FULFILLED_BY]->(DeliveryItem)'],
-  ScheduleLine: ['(SalesOrderItem)-[:HAS_SCHEDULE_LINE]->(ScheduleLine)'],
-  Product: ['(SalesOrderItem)-[:REFERENCES]->(Product)', '(Product)-[:STOCKED_AT]->(ProductPlant)', '(Product)-[:HAS_DESCRIPTION]->(ProductDescription)'],
-  DeliveryHeader: ['(DeliveryItem)-[:PART_OF]->(DeliveryHeader)', '(DeliveryHeader)-[:BILLED_IN]->(BillingItem)'],
-  DeliveryItem: ['(SalesOrderItem)-[:FULFILLED_BY]->(DeliveryItem)', '(DeliveryItem)-[:PART_OF]->(DeliveryHeader)', '(DeliveryItem)-[:AT_PLANT]->(Plant)'],
-  BillingHeader: ['(BillingItem)-[:PART_OF]->(BillingHeader)', '(BillingHeader)-[:POSTED_AS]->(JournalEntry)', '(BillingHeader)-[:PAID_BY]->(Payment)', '(BillingCancellation)-[:CANCELS]->(BillingHeader)'],
-  BillingItem: ['(DeliveryHeader)-[:BILLED_IN]->(BillingItem)', '(BillingItem)-[:PART_OF]->(BillingHeader)'],
-  BillingCancellation: ['(BillingCancellation)-[:CANCELS]->(BillingHeader)'],
-  JournalEntry: ['(BillingHeader)-[:POSTED_AS]->(JournalEntry)'],
-  Payment: ['(BillingHeader)-[:PAID_BY]->(Payment)'],
-  Plant: ['(DeliveryItem)-[:AT_PLANT]->(Plant)', '(ProductPlant)-[:IN_PLANT]->(Plant)'],
-  Address: ['(Customer)-[:HAS_ADDRESS]->(Address)'],
-  CustomerCompany: ['(Customer)-[:ASSIGNED_TO_COMPANY]->(CustomerCompany)'],
-  CustomerSalesArea: ['(Customer)-[:SELLS_THROUGH]->(CustomerSalesArea)'],
-  ProductPlant: ['(Product)-[:STOCKED_AT]->(ProductPlant)', '(ProductPlant)-[:IN_PLANT]->(Plant)'],
-  ProductDescription: ['(Product)-[:HAS_DESCRIPTION]->(ProductDescription)'],
-  ProductStorageLocation: ['(ProductStorageLocation)-[:FOR_PRODUCT]->(Product)'],
-};
-
-// Critical notes that are always included
-const CRITICAL_NOTES = `
+const GENERIC_NOTES = `
 CRITICAL RULES:
-- Amount fields (totalNetAmount, netAmount, amountInTransactionCurrency) are STRINGS. Always use toFloat() before SUM/comparison.
-- Boolean fields (businessPartnerIsBlocked, billingDocumentIsCancelled) are actual booleans: use = true / = false.
-- Customer ID links: Customer.id = SalesOrder.soldToParty = BillingHeader.soldToParty = Payment.customer
-- REVENUE = active (non-cancelled) BillingHeader.totalNetAmount. NEVER use SalesOrder amounts for revenue.
-- When filtering active billing: WHERE bh.billingDocumentIsCancelled = false OR bh.billingDocumentIsCancelled IS NULL
-- There is NO direct relationship between Customer and BillingHeader — use property match WHERE bh.soldToParty = c.id
-- DeliveryItem has NO material field. To get products: (SalesOrderItem)-[:FULFILLED_BY]->(DeliveryItem) then (SalesOrderItem)-[:REFERENCES]->(Product)
-- To join BillingHeader to Payment for clearing time: use Payment.accountingDocument = BillingHeader.accountingDocument
-- For aggregation queries (COUNT, SUM) — put LIMIT AFTER the aggregation, NOT before
-⚠️ DATASET DATE RANGE: The SAP O2C data primarily covers April 2025. Queries using date() ("today"), "this month", or "last 30 days" will likely return EMPTY results. If the user asks about "this month" or "recent", consider filtering for April 2025 instead.
-⚠️ USE ONLY THE RELATIONSHIPS LISTED BELOW. DO NOT INVENT NEW ONES.
+- Use ONLY node labels, properties, and relationships present in the discovered schema below.
+- Do NOT invent relationships, labels, or property names.
+- For aggregation queries (COUNT, SUM, AVG) place LIMIT AFTER the aggregation, not before.
+- If a value looks numeric but the schema says string, convert it with toFloat() before arithmetic.
+- If a field looks like a date stored as string, convert it explicitly before date math.
+- Always alias returned columns with human-readable names.
+- Prefer OPTIONAL MATCH when a relationship may be missing.`.trim();
 
-SAP FIELD MAPPING HINTS:
-- Product "type" or "product type" = productType field (e.g. "ZFS1", "ZF01", "ZPKG"), NOT productGroup (which is material group like "ZFG1001") and NOT productDescription (which is the human-readable name)
-- SalesOrderItem "item category" = salesOrderItemCategory field (e.g. "TAN"), NOT materialGroup (which is different — material groups are like "ZFG1001")
-- "marked for archiving" = isMarkedForArchiving (boolean), different from "blocked" = businessPartnerIsBlocked (boolean)`;
+const DEFAULT_DB_NOTES = `
+SAP DATASET HINTS:
+- Customer.id = SalesOrder.soldToParty = BillingHeader.soldToParty = Payment.customer
+- Revenue should use active BillingHeader.totalNetAmount, not SalesOrder totals.
+- billingDocumentIsCancelled and businessPartnerIsBlocked are booleans.
+- DeliveryItem has no material property; join through SalesOrderItem when product context is required.
+- BillingHeader → Payment often joins via accountingDocument in addition to relationships.
+- Dataset dates are mostly April 2025, so “this month” style questions may need explicit date interpretation.`.trim();
 
-// ── EMBEDDING INDEX ───────────────────────────────────────────────────────────
-let libraryEmbedded = false;
-
-const CONTEXT_CACHE_TTL_MS = parseInt(process.env.GRAPHRAG_CONTEXT_CACHE_TTL_MS ?? '600000', 10); // 10 min
-const CONTEXT_CACHE_MAX = parseInt(process.env.GRAPHRAG_CONTEXT_CACHE_MAX ?? '100', 10);
-const contextCache = new Map<string, { value: GraphRAGContext; expiresAt: number }>();
-
-function embedLibrary(): void {
-  if (libraryEmbedded) return;
-  console.log(`  [GraphRAG] Embedding ${QUERY_LIBRARY.length} curated examples...`);
-  for (const example of QUERY_LIBRARY) {
-    example.embedding = getLocalEmbedding(example.question);
-  }
-  libraryEmbedded = true;
-  console.log(`  [GraphRAG] Library embedded (TF-IDF) \u2713`);
-}
-
-
-
-
-
-// ── PUBLIC API ────────────────────────────────────────────────────────────────
+const CONTEXT_CACHE_TTL_MS = parseInt(
+  process.env.GRAPHRAG_CONTEXT_CACHE_TTL_MS ?? "600000",
+  10,
+);
+const CONTEXT_CACHE_MAX = parseInt(
+  process.env.GRAPHRAG_CONTEXT_CACHE_MAX ?? "100",
+  10,
+);
+const contextCache = new Map<
+  string,
+  { value: GraphRAGContext; expiresAt: number }
+>();
+const embeddedLibraries = new Set<string>();
 
 export interface GraphRAGContext {
-  fewShotExamples: string;      // Formatted few-shot Cypher examples
-  schemaSubset: string;          // Only relevant node types + relationships
-  matchedExamples: string[];     // Which examples were matched (for logging)
+  fewShotExamples: string;
+  schemaSubset: string;
+  matchedExamples: string[];
 }
 
-/**
- * Retrieve the top-K most similar curated examples + build a targeted schema context.
- * This replaces the 135-line full schema with a focused 30-50 line mini-schema.
- */
-export async function retrieveContext(question: string, topK: number = 5): Promise<GraphRAGContext> {
-  embedLibrary();
-
-  const cacheKey = `${question.trim().toLowerCase()}|topK=${topK}`;
+export async function retrieveContext(
+  dbId: string,
+  question: string,
+  topK: number = 5,
+): Promise<GraphRAGContext> {
+  const cacheKey = `${dbId}|${question.trim().toLowerCase()}|topK=${topK}`;
   const cached = contextCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.value;
   }
 
-  const queryEmb = getLocalEmbedding(question);
-  
-  // Score all examples
-  const scored = QUERY_LIBRARY
-    .filter(ex => ex.embedding)
-    .map(ex => ({ example: ex, score: cosineSimilarity(queryEmb, ex.embedding!) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
-
-  console.log(`  [GraphRAG] Top-${topK} matches:`);
-  for (const { example, score } of scored) {
-    console.log(`    ${score.toFixed(3)} → "${example.question.substring(0, 60)}..."`);
+  let liveSchema = getLiveSchema(dbId);
+  if (!liveSchema) {
+    try {
+      liveSchema = await discoverSchema(dbId);
+    } catch (err) {
+      console.log(
+        `  [GraphRAG/${dbId}] Live schema unavailable: ${(err as Error).message?.substring(0, 100)}`,
+      );
+    }
   }
 
-  // ── BUILD FEW-SHOT EXAMPLES ──
-  const fewShotExamples = scored
-    .map(({ example }, i) => 
-      `Example ${i + 1}:\nQ: "${example.question}"\nCypher: ${example.cypher}`)
-    .join('\n\n');
+  const library = getQueryLibraryForDb(dbId);
+  embedLibrary(dbId, library);
 
-  // ── BUILD SCHEMA SUBSET ──
-  // PREFER live schema from SchemaAgent (auto-discovered from Neo4j)
-  // FALLBACK to hardcoded NODE_SCHEMAS if agent hasn't run yet
-  const liveSchema = getLiveSchema();
+  const queryEmb = getLocalEmbedding(question);
+  const scored = library
+    .filter((ex) => ex.embedding)
+    .map((ex) => ({
+      example: ex,
+      score: cosineSimilarity(queryEmb, ex.embedding!),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, topK));
 
-  // Collect all node types from the matched examples
+  console.log(`  [GraphRAG/${dbId}] Top-${topK} matches:`);
+  for (const { example, score } of scored) {
+    console.log(
+      `    ${score.toFixed(3)} → "${example.question.substring(0, 60)}..."`,
+    );
+  }
+
+  const fewShotExamples =
+    scored.length > 0
+      ? scored
+          .map(
+            ({ example }, i) =>
+              `Example ${i + 1}:\nQ: "${example.question}"\nCypher: ${example.cypher}`,
+          )
+          .join("\n\n")
+      : "No curated examples available for this database yet. Use the live schema below carefully.";
+
   const relevantNodes = new Set<string>();
   for (const { example } of scored) {
     for (const node of example.schemaNodes) {
       relevantNodes.add(node);
     }
   }
-  
-  // Always include Customer (it's the anchor of most queries)
-  relevantNodes.add('Customer');
-
-  let nodeLines: string[];
-  let relLines: string[];
 
   if (liveSchema) {
-    // LIVE SCHEMA PATH: Use auto-discovered schema from Neo4j
-    // Include relevant nodes from examples + any additional nodes mentioned in the question
     const questionLower = question.toLowerCase();
     for (const node of liveSchema.nodes) {
       if (questionLower.includes(node.label.toLowerCase())) {
@@ -165,68 +123,82 @@ export async function retrieveContext(question: string, topK: number = 5): Promi
       }
     }
 
+    if (relevantNodes.size === 0) {
+      for (const node of [...liveSchema.nodes]
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 4)) {
+        relevantNodes.add(node.label);
+      }
+    }
+  }
+
+  let nodeLines: string[] = [];
+  let relLines: string[] = [];
+
+  if (liveSchema) {
     nodeLines = Array.from(relevantNodes)
-      .map(n => getFormattedNodeSchema(n))
+      .map((label) => getFormattedNodeSchema(label, dbId))
       .filter((s): s is string => s !== null)
-      .map(s => `- ${s}`);
+      .map((s) => `- ${s}`);
 
-    // If we found less than 3 relevant nodes, include ALL schemas
-    // (better to give the LLM too much context than too little)
     if (nodeLines.length < 3) {
-      const allSchemas = getAllFormattedSchemas();
-      nodeLines = Object.values(allSchemas).map(s => `- ${s}`);
+      nodeLines = Object.values(getAllFormattedSchemas(dbId)).map(
+        (s) => `- ${s}`,
+      );
     }
 
-    // Collect relevant relationships (deduplicated)
     const relSet = new Set<string>();
-    for (const node of relevantNodes) {
-      for (const rel of getRelationshipsForNode(node)) {
+    for (const label of relevantNodes) {
+      for (const rel of getRelationshipsForNode(label, dbId)) {
         relSet.add(rel);
       }
     }
-    // If few relationships found, include all
     if (relSet.size < 3) {
-      for (const rel of getAllRelationshipStrings()) {
-        relSet.add(rel);
-      }
-    }
-    relLines = Array.from(relSet);
-  } else {
-    // FALLBACK: Use hardcoded schemas (SchemaAgent hasn't run yet)
-    nodeLines = Array.from(relevantNodes)
-      .filter(n => NODE_SCHEMAS[n])
-      .map(n => `- ${NODE_SCHEMAS[n]}`);
-
-    const relSet = new Set<string>();
-    for (const node of relevantNodes) {
-      const rels = RELATIONSHIP_MAP[node] ?? [];
-      for (const rel of rels) {
+      for (const rel of getAllRelationshipStrings(dbId)) {
         relSet.add(rel);
       }
     }
     relLines = Array.from(relSet);
   }
 
-  const schemaSubset = `Node types (${liveSchema ? 'LIVE — auto-discovered from database' : 'STATIC — hardcoded'}):
-${nodeLines.join('\n')}
+  const notes =
+    dbId === DEFAULT_DB_ID
+      ? `${GENERIC_NOTES}\n\n${DEFAULT_DB_NOTES}`
+      : GENERIC_NOTES;
 
-Relationships:
-${relLines.join('\n')}
-
-${CRITICAL_NOTES}`;
+  const schemaSubset = liveSchema
+    ? `Node types (LIVE — auto-discovered from database):\n${nodeLines.join("\n")}\n\nRelationships:\n${relLines.join("\n")}\n\n${notes}`
+    : `Schema discovery has not succeeded for this database yet. Use very conservative Cypher and do not assume unavailable labels or relationships.\n\n${notes}`;
 
   const ctx: GraphRAGContext = {
     fewShotExamples,
     schemaSubset,
-    matchedExamples: scored.map(s => s.example.question),
+    matchedExamples: scored.map((s) => s.example.question),
   };
 
-  contextCache.set(cacheKey, { value: ctx, expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS });
+  contextCache.set(cacheKey, {
+    value: ctx,
+    expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS,
+  });
   if (contextCache.size > CONTEXT_CACHE_MAX) {
-    // Map preserves insertion order; remove oldest entries first.
     const oldestKey = contextCache.keys().next().value as string | undefined;
     if (oldestKey) contextCache.delete(oldestKey);
   }
 
   return ctx;
+}
+
+function embedLibrary(dbId: string, library: QueryExample[]): void {
+  if (embeddedLibraries.has(dbId)) return;
+
+  console.log(
+    `  [GraphRAG/${dbId}] Embedding ${library.length} example queries...`,
+  );
+  for (const example of library) {
+    if (!example.embedding) {
+      example.embedding = getLocalEmbedding(example.question);
+    }
+  }
+  embeddedLibraries.add(dbId);
+  console.log(`  [GraphRAG/${dbId}] Library embedded (TF-IDF) ✓`);
 }
