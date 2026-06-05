@@ -1,20 +1,23 @@
-// ── SCHEMA DISCOVERY AGENT ────────────────────────────────────────────────────
-// Introspects the Neo4j database on startup to discover ALL node labels,
-// properties, relationship types, and sample values. This replaces hardcoded
-// schema maps so the LLM always knows the full database structure.
+// ── SCHEMA DISCOVERY AGENT (per-DB) ──────────────────────────────────────────
+// Introspects any registered Neo4j database on demand to discover ALL node
+// labels, properties, relationship types, and sample values.
 //
-// Why: Without this, the LLM can't generate Cypher for fields it doesn't
-// know about (e.g., product.baseUnit, billingItem.billingQuantityUnit).
-// With this, novel queries about ANY field work automatically.
+// Each DB's schema is stored in a Map<dbId, LiveSchema> so multiple databases
+// can be served concurrently without state collision.
+//
+// Backward-compatible: all public functions accept an optional `dbId` and
+// fall back to the current default DB when omitted, so existing callers
+// (graphRAG.ts, server.ts) work without changes.
 
-import { runQuery } from '../db.js';
+import { runRegisteredQuery } from "../db/connectionRegistry.js";
+import { getDefaultDbId } from "../db/connectionRegistry.js";
 
 // ── TYPES ─────────────────────────────────────────────────────────────────────
 
 export interface NodeProperty {
   name: string;
-  types: string[];          // e.g. ["String"], ["Boolean"], ["Long"]
-  sampleValues: unknown[];  // 3-5 real values from the DB
+  types: string[]; // e.g. ["String"], ["Boolean"], ["Long"]
+  sampleValues: unknown[]; // 3-5 real values from the DB
 }
 
 export interface NodeSchema {
@@ -37,210 +40,286 @@ export interface LiveSchema {
   totalNodeLabels: number;
   totalRelTypes: number;
   totalProperties: number;
+  /** The dbId this schema belongs to */
+  dbId: string;
 }
 
-// ── SINGLETON ─────────────────────────────────────────────────────────────────
+// ── PER-DB SCHEMA STORE ───────────────────────────────────────────────────────
 
-let _liveSchema: LiveSchema | null = null;
+/** Keyed by dbId — holds the live schema for every analyzed database. */
+const _liveSchemas = new Map<string, LiveSchema>();
 
-export function getLiveSchema(): LiveSchema | null {
-  return _liveSchema;
+// ── PUBLIC GETTERS ────────────────────────────────────────────────────────────
+
+/** Returns the live schema for a given DB, or null if not yet discovered. */
+export function getLiveSchema(dbId?: string): LiveSchema | null {
+  return _liveSchemas.get(dbId ?? getDefaultDbId()) ?? null;
 }
 
-// ── CONVENIENCE GETTERS (for hybridExecutor validation) ───────────────────────
-
-export function getValidNodeLabels(): Set<string> {
-  if (!_liveSchema) return new Set();
-  return new Set(_liveSchema.nodes.map(n => n.label));
+/** Returns true if a schema has been discovered for the given DB. */
+export function hasSchema(dbId: string): boolean {
+  return _liveSchemas.has(dbId);
 }
 
-export function getValidRelationships(): Set<string> {
-  if (!_liveSchema) return new Set();
-  return new Set(_liveSchema.relationships.map(r => r.type));
+/** All valid node labels for a DB (empty set if schema not discovered). */
+export function getValidNodeLabels(dbId?: string): Set<string> {
+  const schema = _liveSchemas.get(dbId ?? getDefaultDbId());
+  if (!schema) return new Set();
+  return new Set(schema.nodes.map((n) => n.label));
 }
 
-// ── FORMAT: Build LLM-readable schema string for a given node label ──────────
+/** All valid relationship types for a DB (empty set if schema not discovered). */
+export function getValidRelationships(dbId?: string): Set<string> {
+  const schema = _liveSchemas.get(dbId ?? getDefaultDbId());
+  if (!schema) return new Set();
+  return new Set(schema.relationships.map((r) => r.type));
+}
 
+// ── FORMATTED SCHEMA STRINGS (for LLM context) ───────────────────────────────
+
+/** Format a single NodeSchema into a human/LLM-readable property string. */
 function formatNodeSchema(node: NodeSchema): string {
-  const props = node.properties.map(p => {
-    const typeStr = p.types.join('|');
+  const props = node.properties.map((p) => {
+    const typeStr = p.types.join("|");
 
-    // Determine Neo4j type hint for the LLM
-    let hint = '';
-    if (typeStr.includes('Boolean')) {
-      hint = '(boolean)';
-    } else if (typeStr.includes('Long') || typeStr.includes('Double') || typeStr.includes('Float')) {
-      hint = '(number)';
+    let hint = "";
+    if (typeStr.includes("Boolean")) {
+      hint = "(boolean)";
+    } else if (
+      typeStr.includes("Long") ||
+      typeStr.includes("Double") ||
+      typeStr.includes("Float")
+    ) {
+      hint = "(number)";
     } else {
-      hint = '(string)';
+      hint = "(string)";
     }
 
-    // Add sample values for context
     const samples = p.sampleValues
-      .filter(v => v !== null && v !== undefined)
+      .filter((v) => v !== null && v !== undefined)
       .slice(0, 3);
-    const sampleStr = samples.length > 0
-      ? `, e.g. ${samples.map(v => typeof v === 'string' ? `"${v}"` : String(v)).join(', ')}`
-      : '';
+    const sampleStr =
+      samples.length > 0
+        ? `, e.g. ${samples.map((v) => (typeof v === "string" ? `"${v}"` : String(v))).join(", ")}`
+        : "";
 
-    // Special hints for known tricky fields
-    const lowerName = p.name.toLowerCase();
-    let specialHint = '';
-    if (/(amount|netamount|totalnetamount|totalamount)$/i.test(p.name) && typeStr.includes('String')) {
-      specialHint = ' — use toFloat() before arithmetic';
+    let specialHint = "";
+    if (
+      /(amount|netamount|totalnetamount|totalamount)$/i.test(p.name) &&
+      typeStr.includes("String")
+    ) {
+      specialHint = " — use toFloat() before arithmetic";
     }
-    if (/date$/i.test(p.name) && typeStr.includes('String')) {
+    if (/date$/i.test(p.name) && typeStr.includes("String")) {
       specialHint = ' — string "YYYY-MM-DD", use date() to convert';
     }
-    if (/(iscancelled|isblocked|ismarkedfor)/i.test(p.name) && typeStr.includes('Boolean')) {
-      specialHint = ' — use = true / = false';
+    if (
+      /(iscancelled|isblocked|ismarkedfor)/i.test(p.name) &&
+      typeStr.includes("Boolean")
+    ) {
+      specialHint = " — use = true / = false";
     }
 
     return `${p.name}${hint}${sampleStr}${specialHint}`;
   });
-
-  return `${node.label} {${props.join(', ')}}`;
+  return `${node.label} {${props.join(", ")}}`;
 }
 
-// ── PUBLIC: Get formatted schema for specific node labels ─────────────────────
-
-export function getFormattedNodeSchema(label: string): string | null {
-  if (!_liveSchema) return null;
-  const node = _liveSchema.nodes.find(n => n.label === label);
+/** Returns the formatted schema string for one node label in a specific DB. */
+export function getFormattedNodeSchema(
+  label: string,
+  dbId?: string,
+): string | null {
+  const schema = _liveSchemas.get(dbId ?? getDefaultDbId());
+  if (!schema) return null;
+  const node = schema.nodes.find((n) => n.label === label);
   if (!node) return null;
   return formatNodeSchema(node);
 }
 
-export function getAllFormattedSchemas(): Record<string, string> {
-  if (!_liveSchema) return {};
+/** Returns formatted schema strings for ALL node labels in a specific DB. */
+export function getAllFormattedSchemas(dbId?: string): Record<string, string> {
+  const schema = _liveSchemas.get(dbId ?? getDefaultDbId());
+  if (!schema) return {};
   const result: Record<string, string> = {};
-  for (const node of _liveSchema.nodes) {
+  for (const node of schema.nodes) {
     result[node.label] = formatNodeSchema(node);
   }
   return result;
 }
 
-// ── PUBLIC: Get relationship strings ──────────────────────────────────────────
+// ── RELATIONSHIP HELPERS ──────────────────────────────────────────────────────
 
-export function getRelationshipsForNode(label: string): string[] {
-  if (!_liveSchema) return [];
-  return _liveSchema.relationships
-    .filter(r => r.fromLabel === label || r.toLabel === label)
-    .map(r => `(${r.fromLabel})-[:${r.type}]->(${r.toLabel})`);
+/** All relationship strings that involve a given node label (from or to). */
+export function getRelationshipsForNode(
+  label: string,
+  dbId?: string,
+): string[] {
+  const schema = _liveSchemas.get(dbId ?? getDefaultDbId());
+  if (!schema) return [];
+  return schema.relationships
+    .filter((r) => r.fromLabel === label || r.toLabel === label)
+    .map((r) => `(${r.fromLabel})-[:${r.type}]->(${r.toLabel})`);
 }
 
-export function getAllRelationshipStrings(): string[] {
-  if (!_liveSchema) return [];
-  return _liveSchema.relationships.map(r =>
-    `(${r.fromLabel})-[:${r.type}]->(${r.toLabel})`
+/** All relationship strings in the DB schema. */
+export function getAllRelationshipStrings(dbId?: string): string[] {
+  const schema = _liveSchemas.get(dbId ?? getDefaultDbId());
+  if (!schema) return [];
+  return schema.relationships.map(
+    (r) => `(${r.fromLabel})-[:${r.type}]->(${r.toLabel})`,
   );
 }
 
-// ── DISCOVERY ─────────────────────────────────────────────────────────────────
+// ── SCHEMA DISCOVERY ──────────────────────────────────────────────────────────
 
-export async function discoverSchema(): Promise<LiveSchema> {
-  console.log('  [SchemaAgent] Starting schema discovery from Neo4j...');
+/**
+ * Introspect a registered Neo4j database and store its schema.
+ *
+ * @param dbId   The registry id of the database to analyze.
+ *               Defaults to the current default DB when omitted.
+ * @returns      The fully populated LiveSchema.
+ */
+export async function discoverSchema(dbId?: string): Promise<LiveSchema> {
+  const resolvedId = dbId ?? getDefaultDbId();
+  console.log(`  [SchemaAgent/${resolvedId}] Starting schema discovery...`);
   const startTime = Date.now();
 
-  // ── Step 1: Discover all node labels and their counts ──
-  const labelResults = await runQuery(`
+  // ── Step 1: All node labels and counts ────────────────────────────────────
+  const labelResults = await runRegisteredQuery(
+    resolvedId,
+    `
     MATCH (n)
     WITH labels(n)[0] AS label, count(n) AS cnt
     RETURN label, cnt
     ORDER BY cnt DESC
-  `, {});
+  `,
+    {},
+  );
 
   const labels = labelResults
-    .map(r => ({ label: r.label as string, count: r.cnt as number }))
-    .filter(r => r.label); // Filter out null labels
+    .map((r) => ({ label: r.label as string, count: r.cnt as number }))
+    .filter((r) => r.label);
 
-  console.log(`  [SchemaAgent] Found ${labels.length} node labels: ${labels.map(l => l.label).join(', ')}`);
+  console.log(
+    `  [SchemaAgent/${resolvedId}] Found ${labels.length} node labels: ${labels.map((l) => l.label).join(", ")}`,
+  );
 
-  // ── Step 2: For each label, discover properties with types and sample values ──
+  // ── Step 2: Properties + sample values per label ──────────────────────────
   const nodeSchemas: NodeSchema[] = [];
 
   for (const { label, count } of labels) {
     try {
-      // Adaptive sample size: small collections get full scan,
-      // large collections get representative sample.
-      // This ensures we discover ALL property keys, even sparse ones.
+      // Adaptive sample: small collections scanned fully, large ones sampled.
       const sampleLimit = count <= 500 ? count : count <= 5000 ? 100 : 50;
-      
-      // Get ALL property keys across the sampled nodes
-      const propResults = await runQuery(`
+
+      const propResults = await runRegisteredQuery(
+        resolvedId,
+        `
         MATCH (n:\`${label}\`)
         WITH n LIMIT ${sampleLimit}
         UNWIND keys(n) AS propKey
         WITH propKey, collect(n[propKey])[0..5] AS samples
         RETURN propKey, samples
         ORDER BY propKey
-      `, {});
+      `,
+        {},
+      );
 
-      const properties: NodeProperty[] = propResults.map(r => {
+      const properties: NodeProperty[] = propResults.map((r) => {
         const samples = (r.samples as unknown[]) ?? [];
-        // Infer type from sample values
         const types: string[] = [];
         for (const s of samples) {
           if (s === null || s === undefined) continue;
-          if (typeof s === 'boolean') { if (!types.includes('Boolean')) types.push('Boolean'); }
-          else if (typeof s === 'number') { if (!types.includes('Long')) types.push('Long'); }
-          else if (typeof s === 'string') { if (!types.includes('String')) types.push('String'); }
-          else { if (!types.includes('Object')) types.push('Object'); }
+          if (typeof s === "boolean") {
+            if (!types.includes("Boolean")) types.push("Boolean");
+          } else if (typeof s === "number") {
+            if (!types.includes("Long")) types.push("Long");
+          } else if (typeof s === "string") {
+            if (!types.includes("String")) types.push("String");
+          } else {
+            if (!types.includes("Object")) types.push("Object");
+          }
         }
-        if (types.length === 0) types.push('String'); // Default
+        if (types.length === 0) types.push("String");
 
         return {
           name: r.propKey as string,
           types,
-          sampleValues: samples.filter(s => s !== null && s !== undefined).slice(0, 3),
+          sampleValues: samples
+            .filter((s) => s !== null && s !== undefined)
+            .slice(0, 3),
         };
       });
 
       nodeSchemas.push({ label, properties, count });
     } catch (err) {
-      console.log(`  [SchemaAgent] Warning: Could not introspect ${label}: ${(err as Error).message?.substring(0, 60)}`);
+      console.log(
+        `  [SchemaAgent/${resolvedId}] Warning: Could not introspect ${label}: ${(err as Error).message?.substring(0, 60)}`,
+      );
       nodeSchemas.push({ label, properties: [], count });
     }
   }
 
-  // ── Step 3: Discover all relationship types with start/end labels ──
-  const relResults = await runQuery(`
+  // ── Step 3: Relationship types with start/end labels ──────────────────────
+  const relResults = await runRegisteredQuery(
+    resolvedId,
+    `
     MATCH (a)-[r]->(b)
     WITH labels(a)[0] AS fromLabel, type(r) AS relType, labels(b)[0] AS toLabel, count(r) AS cnt
     RETURN fromLabel, relType, toLabel, cnt
     ORDER BY cnt DESC
-  `, {});
+  `,
+    {},
+  );
 
-  const relationships: RelationshipSchema[] = relResults.map(r => ({
+  const relationships: RelationshipSchema[] = relResults.map((r) => ({
     type: r.relType as string,
     fromLabel: r.fromLabel as string,
     toLabel: r.toLabel as string,
     count: r.cnt as number,
   }));
 
-  console.log(`  [SchemaAgent] Found ${relationships.length} relationship types`);
+  console.log(
+    `  [SchemaAgent/${resolvedId}] Found ${relationships.length} relationship types`,
+  );
 
-  // ── Step 4: Build and store the live schema ──
-  const totalProperties = nodeSchemas.reduce((sum, n) => sum + n.properties.length, 0);
+  // ── Step 4: Store ─────────────────────────────────────────────────────────
+  const totalProperties = nodeSchemas.reduce(
+    (sum, n) => sum + n.properties.length,
+    0,
+  );
 
-  _liveSchema = {
+  const liveSchema: LiveSchema = {
     nodes: nodeSchemas,
     relationships,
     discoveredAt: new Date().toISOString(),
     totalNodeLabels: nodeSchemas.length,
     totalRelTypes: relationships.length,
     totalProperties,
+    dbId: resolvedId,
   };
 
-  const elapsed = Date.now() - startTime;
-  console.log(`  [SchemaAgent] Schema discovery complete in ${elapsed}ms`);
-  console.log(`  [SchemaAgent] ${nodeSchemas.length} node types, ${relationships.length} relationship types, ${totalProperties} properties discovered`);
+  _liveSchemas.set(resolvedId, liveSchema);
 
-  // Log a summary of discovered properties per node (helpful for debugging)
+  const elapsed = Date.now() - startTime;
+  console.log(
+    `  [SchemaAgent/${resolvedId}] Discovery complete in ${elapsed}ms — ${nodeSchemas.length} node types, ${relationships.length} rel types, ${totalProperties} properties`,
+  );
+
   for (const node of nodeSchemas) {
-    const propNames = node.properties.map(p => p.name).join(', ');
+    const propNames = node.properties.map((p) => p.name).join(", ");
     console.log(`    ${node.label} (${node.count} nodes): ${propNames}`);
   }
 
-  return _liveSchema;
+  return liveSchema;
+}
+
+/**
+ * Remove a DB's schema from the in-memory store.
+ * Called when a DB is deregistered.
+ */
+export function clearSchema(dbId: string): void {
+  _liveSchemas.delete(dbId);
+  console.log(`  [SchemaAgent] Schema cleared for: ${dbId}`);
 }
